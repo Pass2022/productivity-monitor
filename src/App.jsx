@@ -1,18 +1,16 @@
-import React, { useState, useEffect, useRef } from 'react';
-
-// Main App component for the Chrome Extension
 const App = () => {
     // State to store the active tab's URL
     const [activeTabUrl, setActiveTabUrl] = useState('No active tab');
-    // State to store the accumulated tab activity data
+    // State to store the accumulated historical tab activity data
     const [tabActivity, setTabActivity] = useState({});
     // Ref to hold the ID of the currently active tab
     const activeTabIdRef = useRef(null);
-    // Ref to hold the timestamp when the current tab became active
+    // Ref to hold the timestamp when the current tab became active (used for both historical and current duration)
     const tabActivationTimeRef = useRef(null);
+    // State to store the duration of the *currently* active tab in real-time
+    const [currentTabDuration, setCurrentTabDuration] = useState(0);
 
     // Function to safely access chrome API methods, or provide a mock
-    // This allows the React app to run outside of a Chrome Extension environment for development/testing
     const getChromeApi = () => {
         if (typeof chrome !== 'undefined' && chrome.tabs && chrome.storage && chrome.windows) {
             return chrome;
@@ -67,7 +65,6 @@ const App = () => {
     useEffect(() => {
         // Function to load existing tab activity from local storage
         const loadTabActivity = async () => {
-            // Check if chrome.storage is available before trying to use it
             if (!currentChrome || !currentChrome.storage) {
                 console.warn("Chrome storage API not available, cannot load activity.");
                 return;
@@ -86,14 +83,12 @@ const App = () => {
 
         // Function to get the initially active tab when the extension popup opens
         const getActiveTab = async () => {
-            // Check if chrome.tabs is available before trying to use it
             if (!currentChrome || !currentChrome.tabs) {
                 console.warn("Chrome tabs API not available, cannot get active tab.");
                 return;
             }
             try {
                 const tabs = await new Promise((resolve) => {
-                    // Query for the active tab in the current window
                     currentChrome.tabs.query({ active: true, currentWindow: true }, resolve);
                 });
                 if (tabs && tabs.length > 0) {
@@ -101,28 +96,26 @@ const App = () => {
                     activeTabIdRef.current = tab.id;
                     setActiveTabUrl(tab.url || 'Unknown URL');
                     tabActivationTimeRef.current = Date.now();
+                    setCurrentTabDuration(0); // Reset current tab duration when a new tab is set
                 }
             } catch (error) {
                 console.error('Error getting active tab:', error);
             }
         };
 
-        // Function to update the duration for the previously active tab
+        // Function to update the duration for the previously active tab (for historical record)
         const updatePreviousTabDuration = () => {
-            // Only update if there was an active tab being tracked and storage is available
             if (activeTabIdRef.current && tabActivationTimeRef.current && currentChrome && currentChrome.storage) {
                 const duration = Date.now() - tabActivationTimeRef.current;
                 setTabActivity(prevActivity => {
                     const newActivity = { ...prevActivity };
-                    const url = activeTabUrl; // Use the URL stored in state for the previous tab
+                    const url = activeTabUrl;
 
-                    // Add duration to the existing total for this URL, or start a new entry
                     if (newActivity[url]) {
                         newActivity[url] += duration;
                     } else {
                         newActivity[url] = duration;
                     }
-                    // Persist the updated activity to local storage
                     currentChrome.storage.local.set({ tabActivity: newActivity });
                     return newActivity;
                 });
@@ -131,22 +124,19 @@ const App = () => {
 
         // Listener for when a tab becomes active (user switches tabs)
         const handleTabActivated = async (activeInfo) => {
-            // Ensure chrome.tabs API is available
             if (!currentChrome || !currentChrome.tabs) return;
 
-            // First, update the duration for the tab that was previously active
-            updatePreviousTabDuration();
+            updatePreviousTabDuration(); // Update historical data for the old tab
 
             try {
-                // Get details of the newly activated tab
                 const tab = await new Promise((resolve) => {
                     currentChrome.tabs.get(activeInfo.tabId, resolve);
                 });
                 if (tab) {
-                    // Set the newly active tab's ID, URL, and activation time
                     activeTabIdRef.current = tab.id;
                     setActiveTabUrl(tab.url || 'Unknown URL');
                     tabActivationTimeRef.current = Date.now();
+                    setCurrentTabDuration(0); // Reset current tab duration for the new active tab
                 }
             } catch (error) {
                 console.error('Error handling tab activated:', error);
@@ -155,35 +145,38 @@ const App = () => {
 
         // Listener for when the browser window focus changes (e.g., user switches to another application)
         const handleWindowFocusChanged = async (windowId) => {
-            // Ensure chrome APIs are available
             if (!currentChrome || !currentChrome.tabs || !currentChrome.windows) return;
 
             if (windowId === currentChrome.windows.WINDOW_ID_NONE) {
-                // Browser window lost focus (e.g., user went to another app)
-                // Record duration for the current tab before it loses focus
-                updatePreviousTabDuration();
-                activeTabIdRef.current = null; // No active tab being tracked by the extension
+                updatePreviousTabDuration(); // Update historical data
+                activeTabIdRef.current = null;
                 tabActivationTimeRef.current = null;
+                setCurrentTabDuration(0); // Reset current tab duration
                 setActiveTabUrl('No active tab (window unfocused)');
             } else {
-                // Browser window gained focus
                 try {
-                    // Find the active tab within the newly focused window
                     const tabs = await new Promise((resolve) => {
                         currentChrome.tabs.query({ active: true, windowId: windowId }, resolve);
                     });
                     if (tabs && tabs.length > 0) {
                         const tab = tabs[0];
-                        // Start tracking the newly active tab
                         activeTabIdRef.current = tab.id;
                         setActiveTabUrl(tab.url || 'Unknown URL');
                         tabActivationTimeRef.current = Date.now();
+                        setCurrentTabDuration(0); // Reset current tab duration
                     }
                 } catch (error) {
                     console.error('Error handling window focus changed:', error);
                 }
             }
         };
+
+        // Set up interval to update the current tab's duration every second
+        const intervalId = setInterval(() => {
+            if (tabActivationTimeRef.current) {
+                setCurrentTabDuration(Date.now() - tabActivationTimeRef.current);
+            }
+        }, 1000); // Update every 1 second
 
         // Initialize by loading saved data and getting the current active tab
         loadTabActivity();
@@ -197,17 +190,16 @@ const App = () => {
 
         // Cleanup function for when the component unmounts (e.g., popup closes)
         return () => {
-            // Ensure to update the duration one last time for the currently active tab
-            updatePreviousTabDuration();
-            // Remove event listeners to prevent memory leaks and unnecessary operations
+            clearInterval(intervalId); // Clear the interval when component unmounts
+            updatePreviousTabDuration(); // Ensure final historical update
             if (currentChrome && currentChrome.tabs && currentChrome.windows) {
                 currentChrome.tabs.onActivated.removeListener(handleTabActivated);
                 currentChrome.windows.onFocusChanged.removeListener(handleWindowFocusChanged);
             }
         };
-    }, [activeTabUrl]); // Dependency on activeTabUrl ensures updatePreviousTabDuration has the correct URL
+    }, [activeTabUrl]); // Dependency ensures effect re-runs when activeTabUrl changes to reset timer
 
-    // Helper function to format milliseconds into a human-readable string (e.g., "1h 30m 5s")
+    // Helper function to format milliseconds into a human-readable string
     const formatDuration = (ms) => {
         const seconds = Math.floor(ms / 1000);
         const minutes = Math.floor(seconds / 60);
@@ -216,7 +208,7 @@ const App = () => {
         const parts = [];
         if (hours > 0) parts.push(`${hours}h`);
         if (minutes % 60 > 0) parts.push(`${minutes % 60}m`);
-        if (seconds % 60 > 0 || parts.length === 0) parts.push(`${seconds % 60}s`); // Ensure at least seconds are shown
+        if (seconds % 60 > 0 || parts.length === 0) parts.push(`${seconds % 60}s`);
 
         return parts.join(' ');
     };
@@ -228,6 +220,9 @@ const App = () => {
             <div style={styles.currentTab}>
                 <p style={styles.currentTabLabel}><strong>Current Active Tab:</strong></p>
                 <p style={styles.currentUrl}>{activeTabUrl}</p>
+                <p style={styles.currentTabTimer}>
+                    Duration: <span style={styles.currentTabDurationValue}>{formatDuration(currentTabDuration)}</span>
+                </p>
             </div>
             <h2 style={styles.sectionHeader}>Activity Summary:</h2>
             {Object.keys(tabActivity).length === 0 ? (
@@ -235,7 +230,7 @@ const App = () => {
             ) : (
                 <ul style={styles.activityList}>
                     {Object.entries(tabActivity)
-                        .sort(([, a], [, b]) => b - a) // Sort by duration in descending order (longest time first)
+                        .sort(([, a], [, b]) => b - a) // Sort by duration in descending order
                         .map(([url, duration]) => (
                             <li key={url} style={styles.activityItem}>
                                 <span style={styles.activityUrl}>{url}:</span>
@@ -244,136 +239,114 @@ const App = () => {
                         ))}
                 </ul>
             )}
-            <button
-                onClick={() => {
-                    setTabActivity({}); // Clear state
-                    // Clear data from Chrome's local storage
-                    if (currentChrome && currentChrome.storage) {
-                        currentChrome.storage.local.set({ tabActivity: {} });
-                    } else {
-                        localStorage.removeItem('mockTabActivity'); // Clear mock storage for dev environment
-                    }
-                }}
-                style={styles.clearButton}
-            >
-                Clear All Activity
-            </button>
+            {/* The "Clear All Activity" button has been removed as per your request */}
         </div>
     );
 };
 
-// Styles for the React components - defined as a JavaScript object
+// Styles for the React components
 const styles = {
     container: {
         fontFamily: "'Inter', sans-serif",
         padding: '20px',
-        width: '400px', // Fixed width for the extension popup
-        backgroundColor: '#000000', // Black background
+        width: '400px',
+        backgroundColor: '#000000',
         borderRadius: '10px',
-        boxShadow: '0 4px 12px rgba(0, 0, 0, 0.5)', // Adjusted shadow for dark background
-        color: '#ffffff', // White text for general readability
+        boxShadow: '0 4px 12px rgba(0, 0, 0, 0.5)',
+        color: '#ffffff',
         lineHeight: '1.6',
     },
     header: {
         fontSize: '24px',
         fontWeight: 'bold',
         marginBottom: '20px',
-        color: '#4318ff', // Purple accent
+        color: '#4318ff',
         textAlign: 'center',
-        borderBottom: '2px solid #333333', // Dark gray border for contrast
+        borderBottom: '2px solid #333333',
         paddingBottom: '10px',
     },
     currentTab: {
-        backgroundColor: '#1a0d33', // Darker purple background for current tab section
+        backgroundColor: '#1a0d33',
         padding: '15px',
         borderRadius: '8px',
         marginBottom: '20px',
-        border: '1px solid #4318ff', // Purple border
+        border: '1px solid #4318ff',
     },
     currentTabLabel: {
-        color: '#ffffff', // White label for contrast
-        margin: '0 0 5px 0', // Adjust margin
+        color: '#ffffff',
+        margin: '0 0 5px 0',
     },
     currentUrl: {
-        wordBreak: 'break-all', // Ensures long URLs wrap correctly
+        wordBreak: 'break-all',
         fontSize: '14px',
-        color: '#b380ff', // Lighter purple for the URL for visibility
+        color: '#b380ff',
         fontWeight: '500',
-        margin: '0', // Remove default paragraph margin
+        margin: '0',
+    },
+    currentTabTimer: {
+        fontSize: '16px',
+        color: '#ffffff',
+        marginTop: '10px',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        fontWeight: 'bold',
+    },
+    currentTabDurationValue: {
+        color: '#90ee90', // Light green for duration
+        fontSize: '18px',
+        marginLeft: '10px',
     },
     sectionHeader: {
         fontSize: '20px',
         fontWeight: 'bold',
         marginBottom: '15px',
-        color: '#4318ff', // Purple accent
-        borderBottom: '1px solid #333333', // Dark gray border
+        color: '#4318ff',
+        borderBottom: '1px solid #333333',
         paddingBottom: '5px',
     },
     noActivity: {
         fontStyle: 'italic',
-        color: '#cccccc', // Light gray for visibility on black
+        color: '#cccccc',
         textAlign: 'center',
         padding: '20px 0',
     },
     activityList: {
-        listStyleType: 'none', // Remove bullet points
+        listStyleType: 'none',
         padding: '0',
-        maxHeight: '300px', // Limits height and adds scrollbar if content overflows
+        maxHeight: '300px',
         overflowY: 'auto',
-        border: '1px solid #333333', // Dark gray border
+        border: '1px solid #333333',
         borderRadius: '8px',
-        backgroundColor: '#1a1a1a', // Slightly lighter black for list background
+        backgroundColor: '#1a1a1a',
     },
     activityItem: {
-        display: 'flex', // Use flexbox for layout
-        justifyContent: 'space-between', // Pushes URL and duration to ends
-        alignItems: 'center', // Centers items vertically
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
         padding: '12px 15px',
-        borderBottom: '1px solid #222222', // Even darker border between items
+        borderBottom: '1px solid #222222',
         backgroundColor: '#1a1a1a',
-        transition: 'background-color 0.3s ease', // Smooth hover effect
+        transition: 'background-color 0.3s ease',
         borderRadius: '8px',
-        marginBottom: '5px', // Spacing between list items
-        boxShadow: '0 2px 4px rgba(0, 0, 0, 0.2)', // Subtle shadow for depth
+        marginBottom: '5px',
+        boxShadow: '0 2px 4px rgba(0, 0, 0, 0.2)',
     },
     activityUrl: {
-        flexGrow: '1', // Allows URL to take up available space
+        flexGrow: '1',
         marginRight: '10px',
         wordBreak: 'break-all',
-        color: '#e0e0e0', // Light gray for URLs
+        color: '#e0e0e0',
         fontSize: '14px',
     },
     activityDuration: {
         fontWeight: '600',
-        color: '#90ee90', // Light green for duration for good contrast
-        minWidth: '60px', // Ensures duration column has minimum width
+        color: '#90ee90',
+        minWidth: '60px',
         textAlign: 'right',
         fontSize: '14px',
     },
-    clearButton: {
-        display: 'block',
-        width: '100%',
-        padding: '12px',
-        marginTop: '20px',
-        backgroundColor: '#660000', // Darker red for clear button
-        color: 'white',
-        border: '1px solid #990000', // Darker red border
-        borderRadius: '8px',
-        fontSize: '16px',
-        cursor: 'pointer',
-        transition: 'background-color 0.3s ease, transform 0.2s ease',
-        boxShadow: '0 4px 8px rgba(0, 0, 0, 0.2)',
-        backgroundImage: 'linear-gradient(45deg, #660000, #4d0000)', // Darker gradient for aesthetic appeal
-        '&:hover': { // Note: These pseudo-classes are for CSS-in-JS libraries like styled-components.
-            // For plain React inline styles, you'd handle hover with onMouseEnter/onMouseLeave.
-            // They are included here for illustrative purposes of desired effect.
-            backgroundColor: '#4d0000', // Darker red on hover
-            transform: 'translateY(-2px)', // Slight lift effect
-        },
-        '&:active': {
-            transform: 'translateY(0)', // Push effect on click
-        },
-    },
+    // The clearButton style is no longer needed as the button is removed
 };
 
 export default App;
